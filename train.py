@@ -1,362 +1,190 @@
-#!/usr/bin/env python3
 """
-Train time-to-breach (TTB) and fault-type models.
+Train a spacesuit health model, then export one EVA for the helmet HUD.
 
-COLLABORATOR NOTES — ML placeholders
-=====================================
-This file runs end-to-end (load data -> features -> metrics -> save pkl) but uses
-**placeholder models** in place of the real scikit-learn estimators.
-
-Replace these two classes with production training:
-
-  1. PlaceholderTTBRegressor  ->  sklearn.ensemble.HistGradientBoostingRegressor
-  2. PlaceholderFaultClassifier -> sklearn.ensemble.HistGradientBoostingClassifier
-
-Search for ``TODO(COLLABORATOR)`` markers below. Feature engineering and the
-headline lead-time metric are implemented and ready to use with real models.
+What it does:
+1. Load suit_telemetry.csv
+2. Train on some spacewalks, test on others (never mix the same EVA)
+3. Predict critical_pct (0–100 health risk)
+4. Save the model and one demo timeline for Blender
 """
 
-from __future__ import annotations
-
-import pickle
+import json
 from pathlib import Path
-from typing import Any
 
-import numpy as np
+import joblib
 import pandas as pd
-from sklearn.dummy import DummyClassifier, DummyRegressor
-from sklearn.metrics import accuracy_score, mean_absolute_error
+from sklearn.ensemble import GradientBoostingRegressor
+from sklearn.metrics import accuracy_score, mean_absolute_error, r2_score
+from sklearn.model_selection import train_test_split
 
-from sim import BATTERY_CAPACITY_KWH, WATER_USE_KG_MIN
+# --- files ---
+ROOT = Path(__file__).resolve().parent
+DATA_PATH = ROOT / "suit_telemetry.csv"
+MODEL_PATH = ROOT / "models" / "health_regressor.joblib"
+DEMO_PATH = ROOT / "predictions" / "eva_demo.json"
 
-DATA_PATH = Path("data/episodes.parquet")
-MODEL_PATH = Path("models/ttb.pkl")
-
-# Downsampled rows are 5 min apart (see generate.py).
-TICK_MINUTES = 5
-DELTA_10M_STEPS = 10 // TICK_MINUTES   # 2 rows
-DELTA_30M_STEPS = 30 // TICK_MINUTES   # 6 rows
-ROLL_30M_WINDOW = 6
-
-TELEMETRY_COLS = [
-    "ppO2_kpa",
-    "ppCO2_kpa",
-    "cabin_pressure_kpa",
-    "cabin_humidity_pct",
-    "potable_water_kg",
-    "grey_water_kg",
-    "battery_kwh",
-    "solar_input_kw",
-    "scrubber_efficiency",
-    "electrolyser_o2_kg_h",
-    "eclss_power_kw",
-    "water_reserve_h",
+# Inputs the model is allowed to see (not the fault label).
+FEATURES = [
+    "t_min",
+    "hr_bpm",
+    "resp_rpm",
+    "core_temp_c",
+    "spo2_pct",
+    "ext_temp_c",
+    "helmet_co2_ppm",
+    "suit_press_kpa",
 ]
-
-# ML alarm: predicted TTB below this threshold (minutes).
-ML_ALARM_TTB = 180
-
-# Threshold (caution) alarm bands for headline metric comparison.
-CAUTION_PPO2 = 17.0
-CAUTION_PPCO2 = 0.7
-CAUTION_WATER_RESERVE_H = 24.0
-CAUTION_BATTERY_FRAC = 0.15
+TARGET = "critical_pct"
+CRITICAL_THRESHOLD = 50.0  # HUD: >= 50% is CRITICAL
 
 
-# ---------------------------------------------------------------------------
-# Placeholder models — swap for HistGradientBoosting* (see module docstring)
-# ---------------------------------------------------------------------------
+def status_label(risk_pct: float) -> str:
+    return "CRITICAL" if risk_pct >= CRITICAL_THRESHOLD else "NON-CRITICAL"
 
 
-class PlaceholderTTBRegressor:
-    """
-    TODO(COLLABORATOR): Replace with HistGradientBoostingRegressor.
-
-    Placeholder uses sklearn DummyRegressor (median predictor) so the pipeline
-    runs without tuning. Drop in a real regressor with the same fit/predict API:
-
-        from sklearn.ensemble import HistGradientBoostingRegressor
-        self.model = HistGradientBoostingRegressor(max_depth=6, learning_rate=0.1)
-    """
-
-    def __init__(self) -> None:
-        self.model = DummyRegressor(strategy="median")
-        self.feature_cols: list[str] = []
-
-    def fit(self, X: pd.DataFrame, y: pd.Series) -> "PlaceholderTTBRegressor":
-        self.feature_cols = list(X.columns)
-        self.model.fit(X, y)
-        return self
-
-    def predict(self, X: pd.DataFrame) -> np.ndarray:
-        return self.model.predict(X[self.feature_cols])
+def load_data() -> pd.DataFrame:
+    df = pd.read_csv(DATA_PATH)
+    needed = FEATURES + [TARGET, "eva_id"]
+    missing = [col for col in needed if col not in df.columns]
+    if missing:
+        raise ValueError(f"CSV is missing columns: {missing}")
+    return df
 
 
-class PlaceholderFaultClassifier:
-    """
-    TODO(COLLABORATOR): Replace with HistGradientBoostingClassifier.
-
-    Placeholder uses DummyClassifier (most-frequent class). Swap for:
-
-        from sklearn.ensemble import HistGradientBoostingClassifier
-        self.model = HistGradientBoostingClassifier(max_depth=6, learning_rate=0.1)
-    """
-
-    def __init__(self) -> None:
-        self.model = DummyClassifier(strategy="most_frequent")
-        self.feature_cols: list[str] = []
-        self.classes_: list[str] = []
-
-    def fit(self, X: pd.DataFrame, y: pd.Series) -> "PlaceholderFaultClassifier":
-        self.feature_cols = list(X.columns)
-        self.model.fit(X, y)
-        self.classes_ = list(self.model.classes_)
-        return self
-
-    def predict(self, X: pd.DataFrame) -> np.ndarray:
-        return self.model.predict(X[self.feature_cols])
-
-    def predict_proba(self, X: pd.DataFrame) -> np.ndarray:
-        return self.model.predict_proba(X[self.feature_cols])
-
-
-# ---------------------------------------------------------------------------
-# Feature engineering (production-ready)
-# ---------------------------------------------------------------------------
-
-
-def build_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Current value + 10/30 min deltas + 30 min rolling std per telemetry channel."""
-    parts = [df[["episode_id", "t_min"]].copy()]
-
-    grouped = df.groupby("episode_id", sort=False)
-    for col in TELEMETRY_COLS:
-        current = grouped[col].transform(lambda s: s)
-        delta_10 = grouped[col].transform(lambda s: s - s.shift(DELTA_10M_STEPS))
-        delta_30 = grouped[col].transform(lambda s: s - s.shift(DELTA_30M_STEPS))
-        roll_std = grouped[col].transform(
-            lambda s: s.rolling(ROLL_30M_WINDOW, min_periods=1).std()
-        )
-
-        parts.append(current.rename(col))
-        parts.append(delta_10.rename(f"{col}_delta10"))
-        parts.append(delta_30.rename(f"{col}_delta30"))
-        parts.append(roll_std.rename(f"{col}_std30"))
-
-    features = pd.concat(parts, axis=1)
-    return features.dropna().reset_index(drop=True)
-
-
-def align_labels(df: pd.DataFrame, features: pd.DataFrame) -> pd.DataFrame:
-    """Align fault_type and minutes_to_breach with feature rows (after dropna)."""
-    merged = features.merge(
-        df[["episode_id", "t_min", "fault_type", "minutes_to_breach"]],
-        on=["episode_id", "t_min"],
-        how="left",
+def split_by_eva(df: pd.DataFrame):
+    """Keep each whole spacewalk in train *or* test, not both."""
+    eva_ids = df["eva_id"].drop_duplicates().sort_values()
+    train_ids, test_ids = train_test_split(
+        eva_ids.to_numpy(),
+        test_size=0.2,
+        random_state=42,
     )
-    return merged
+    train = df[df["eva_id"].isin(train_ids)].copy()
+    test = df[df["eva_id"].isin(test_ids)].copy()
+    return train, test, set(test_ids)
 
 
-def feature_columns(features: pd.DataFrame) -> list[str]:
-    return [c for c in features.columns if c not in ("episode_id", "t_min")]
+def pick_demo_eva(df: pd.DataFrame, predicted: pd.Series, test_ids: set) -> str:
+    """
+    Pick one EVA the HUD can play: starts safe, later goes critical.
+    Prefer a seal_leak walk from the test set.
+    """
+    work = df.copy()
+    work["predicted_pct"] = predicted.to_numpy()
 
+    best_id = None
+    best_rank = None  # lower is better: (priority, -rise)
 
-def split_episodes(
-    episode_ids: list[int], test_frac: float = 0.2, seed: int = 42
-) -> tuple[set[int], set[int]]:
-    rng = np.random.default_rng(seed)
-    ids = np.array(sorted(set(episode_ids)))
-    rng.shuffle(ids)
-    n_test = max(1, int(len(ids) * test_frac))
-    test_ids = set(ids[:n_test].tolist())
-    train_ids = set(ids[n_test:].tolist())
-    return train_ids, test_ids
+    for eva_id, group in work.groupby("eva_id"):
+        group = group.sort_values("t_min")
+        preds = group["predicted_pct"]
 
-
-# ---------------------------------------------------------------------------
-# Headline metric
-# ---------------------------------------------------------------------------
-
-
-def _water_reserve_hours(potable_kg: float) -> float:
-    use_kg_h = WATER_USE_KG_MIN * 60.0
-    return potable_kg / use_kg_h if use_kg_h > 0 else float("inf")
-
-
-def threshold_alarm_time(ep_df: pd.DataFrame) -> int | None:
-    """First tick where any raw value crosses the caution band."""
-    battery_limit = BATTERY_CAPACITY_KWH * CAUTION_BATTERY_FRAC
-    for _, row in ep_df.sort_values("t_min").iterrows():
-        reserve_h = row.get("water_reserve_h", _water_reserve_hours(row["potable_water_kg"]))
-        if row["ppO2_kpa"] < CAUTION_PPO2:
-            return int(row["t_min"])
-        if row["ppCO2_kpa"] > CAUTION_PPCO2:
-            return int(row["t_min"])
-        if reserve_h < CAUTION_WATER_RESERVE_H:
-            return int(row["t_min"])
-        if row["battery_kwh"] < battery_limit:
-            return int(row["t_min"])
-    return None
-
-
-def ml_alarm_time(ep_df: pd.DataFrame, pred_ttb: np.ndarray) -> int | None:
-    """First tick where predicted minutes_to_breach < ML_ALARM_TTB."""
-    ep_df = ep_df.sort_values("t_min").reset_index(drop=True)
-    for i, ttb in enumerate(pred_ttb):
-        if ttb < ML_ALARM_TTB:
-            return int(ep_df.loc[i, "t_min"])
-    return None
-
-
-def episode_breach_minute(ep_df: pd.DataFrame) -> int | None:
-    """Recover breach minute from minutes_to_breach column (720 = no breach)."""
-    ep_df = ep_df.sort_values("t_min")
-    for _, row in ep_df.iterrows():
-        mtb = row["minutes_to_breach"]
-        if mtb < 720:
-            return int(row["t_min"] + mtb)
-    return None
-
-
-def headline_metrics(
-    df: pd.DataFrame,
-    test_ids: set[int],
-    ttb_model: PlaceholderTTBRegressor,
-    feature_cols: list[str],
-) -> dict[str, Any]:
-    lead_times: list[float] = []
-    false_alarms = 0
-    nominal_count = 0
-
-    feat_df = build_features(df)
-    labels = align_labels(df, feat_df)
-    X_all = labels[feature_cols]
-
-    for eid in sorted(test_ids):
-        ep_rows = labels[labels["episode_id"] == eid].sort_values("t_min")
-        if ep_rows.empty:
+        starts_safe = preds.iloc[0] < CRITICAL_THRESHOLD
+        later_critical = preds.max() >= CRITICAL_THRESHOLD
+        if not (starts_safe and later_critical):
             continue
 
-        raw_ep = df[df["episode_id"] == eid].sort_values("t_min")
-        fault = raw_ep["fault_type"].iloc[0]
-        breach = episode_breach_minute(raw_ep)
+        fault = str(group["fault"].iloc[0]) if "fault" in group.columns else ""
+        is_seal = fault == "seal_leak"
+        in_test = eva_id in test_ids
+        if is_seal and in_test:
+            priority = 0
+        elif in_test:
+            priority = 1
+        elif is_seal:
+            priority = 2
+        else:
+            priority = 3
 
-        X_ep = ep_rows[feature_cols]
-        pred_ttb = ttb_model.predict(X_ep)
+        rise = float(preds.max() - preds.iloc[0])
+        rank = (priority, -rise)
+        if best_rank is None or rank < best_rank:
+            best_rank = rank
+            best_id = eva_id
 
-        if fault == "nominal":
-            nominal_count += 1
-            if ml_alarm_time(ep_rows, pred_ttb) is not None:
-                false_alarms += 1
-            continue
+    if best_id is None:
+        raise RuntimeError("No EVA goes from safe to critical. Check the CSV.")
+    return best_id
 
-        if breach is None:
-            continue
 
-        ml_t = ml_alarm_time(ep_rows, pred_ttb)
-        thr_t = threshold_alarm_time(raw_ep)
-        if ml_t is not None and thr_t is not None:
-            lead_times.append(thr_t - ml_t)
+def make_hud_json(df: pd.DataFrame, predicted: pd.Series, eva_id: str) -> dict:
+    """One spacewalk as a list of HUD frames."""
+    eva = df.loc[df["eva_id"] == eva_id].copy()
+    eva["predicted_pct"] = predicted.loc[eva.index].to_numpy()
+    eva = eva.sort_values("t_min")
 
-    result: dict[str, Any] = {
-        "lead_times": lead_times,
-        "false_alarm_rate": false_alarms / nominal_count if nominal_count else 0.0,
-        "nominal_episodes": nominal_count,
+    timeline = []
+    for row in eva.itertuples(index=False):
+        risk = round(float(row.predicted_pct), 2)
+        timeline.append({
+            "t_min": int(row.t_min),
+            "predicted_pct": risk,
+            "is_critical": risk >= CRITICAL_THRESHOLD,
+            "hr_bpm": int(row.hr_bpm),
+            "resp_rpm": int(row.resp_rpm),
+            "core_temp_c": round(float(row.core_temp_c), 2),
+            "spo2_pct": int(row.spo2_pct),
+            "ext_temp_c": round(float(row.ext_temp_c), 2),
+            "helmet_co2_ppm": int(row.helmet_co2_ppm),
+            "suit_press_kpa": round(float(row.suit_press_kpa), 2),
+        })
+
+    fault = str(eva["fault"].iloc[0]) if "fault" in eva.columns else None
+    return {
+        "eva_id": eva_id,
+        "fault": fault,
+        "critical_threshold": CRITICAL_THRESHOLD,
+        "n_steps": len(timeline),
+        "timeline": timeline,
     }
-    if lead_times:
-        result["lead_time_median"] = float(np.median(lead_times))
-        q25, q75 = np.percentile(lead_times, [25, 75])
-        result["lead_time_iqr"] = float(q75 - q25)
-    else:
-        result["lead_time_median"] = None
-        result["lead_time_iqr"] = None
-    return result
-
-
-# ---------------------------------------------------------------------------
-# Main training pipeline
-# ---------------------------------------------------------------------------
 
 
 def main() -> None:
-    if not DATA_PATH.exists():
-        raise FileNotFoundError(
-            f"{DATA_PATH} not found. Run `python generate.py` first."
-        )
+    df = load_data()
+    train, test, test_ids = split_by_eva(df)
 
-    df = pd.read_parquet(DATA_PATH)
-    print(f"Loaded {len(df):,} rows, {df['episode_id'].nunique()} episodes")
+    model = GradientBoostingRegressor(random_state=42)
+    model.fit(train[FEATURES], train[TARGET])
 
-    features = build_features(df)
-    data = align_labels(df, features)
-    feat_cols = feature_columns(features)
+    predicted_risk = pd.Series(model.predict(test[FEATURES])).clip(0, 100)
+    true_risk = test[TARGET]
 
-    episode_ids = df["episode_id"].unique().tolist()
-    train_ids, test_ids = split_episodes(episode_ids)
-
-    train_mask = data["episode_id"].isin(train_ids)
-    test_mask = data["episode_id"].isin(test_ids)
-
-    X_train = data.loc[train_mask, feat_cols]
-    X_test = data.loc[test_mask, feat_cols]
-    y_ttb_train = data.loc[train_mask, "minutes_to_breach"]
-    y_ttb_test = data.loc[test_mask, "minutes_to_breach"]
-    y_fault_train = data.loc[train_mask, "fault_type"]
-    y_fault_test = data.loc[test_mask, "fault_type"]
-
-    # TODO(COLLABORATOR): Tune hyperparameters; consider sample weights for rare faults.
-    ttb_model = PlaceholderTTBRegressor()
-    ttb_model.fit(X_train, y_ttb_train)
-
-    fault_model = PlaceholderFaultClassifier()
-    fault_model.fit(X_train, y_fault_train)
-
-    # --- eval metrics ---
-    pred_ttb = ttb_model.predict(X_test)
-    mae = mean_absolute_error(y_ttb_test, pred_ttb)
-
-    pred_fault = fault_model.predict(X_test)
-    fault_acc = accuracy_score(y_fault_test, pred_fault)
-
-    headline = headline_metrics(df, test_ids, ttb_model, feat_cols)
-
-    print("\n--- Evaluation (held-out episodes) ---")
-    print(f"MAE (minutes_to_breach): {mae:.1f}")
-    print(f"Fault classification accuracy: {fault_acc:.3f}")
-    print("\n--- Headline metric (ML vs threshold alarm) ---")
-    if headline["lead_time_median"] is not None:
-        print(f"Lead time median: {headline['lead_time_median']:.0f} min")
-        print(f"Lead time IQR:    {headline['lead_time_iqr']:.0f} min")
-        print(f"  (n={len(headline['lead_times'])} breaching fault episodes)")
-    else:
-        print("Lead time median: n/a (no breaching held-out episodes with both alarms)")
-        print("Lead time IQR:    n/a")
-    print(
-        f"False alarm rate (nominal): {headline['false_alarm_rate']:.3f} "
-        f"({headline['nominal_episodes']} nominal episodes)"
+    mae = mean_absolute_error(true_risk, predicted_risk)
+    r2 = r2_score(true_risk, predicted_risk)
+    acc = accuracy_score(
+        true_risk >= CRITICAL_THRESHOLD,
+        predicted_risk >= CRITICAL_THRESHOLD,
     )
 
-    # --- save bundle for app.py (Stage 3) ---
+    print("=== Suit health model ===")
+    print(f"Train EVAs: {train['eva_id'].nunique()}  Test EVAs: {test['eva_id'].nunique()}")
+    print(f"Train rows: {len(train)}  Test rows: {len(test)}")
+    print(f"MAE (average error in %): {mae:.3f}")
+    print(f"R2 (1.0 = perfect): {r2:.3f}")
+    print(f"CRITICAL vs NON-CRITICAL accuracy: {acc:.3f}")
+
     MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
-    bundle = {
-        "version": "placeholder",
-        "ttb_model": ttb_model,
-        "fault_model": fault_model,
-        "feature_cols": feat_cols,
-        "telemetry_cols": TELEMETRY_COLS,
-        "ml_alarm_ttb": ML_ALARM_TTB,
-        "caution_bands": {
-            "ppO2_kpa": CAUTION_PPO2,
-            "ppCO2_kpa": CAUTION_PPCO2,
-            "water_reserve_h": CAUTION_WATER_RESERVE_H,
-            "battery_frac": CAUTION_BATTERY_FRAC,
-        },
-        # TODO(COLLABORATOR): Add training metadata (timestamp, hyperparams, git hash).
-    }
-    with MODEL_PATH.open("wb") as f:
-        pickle.dump(bundle, f)
-    print(f"\nSaved model bundle -> {MODEL_PATH}")
-    print("NOTE: bundle uses placeholder models — see top of train.py for swap instructions.")
+    joblib.dump(
+        {"model": model, "features": FEATURES, "threshold": CRITICAL_THRESHOLD},
+        MODEL_PATH,
+    )
+    print(f"Saved model: {MODEL_PATH}")
+
+    all_pred = pd.Series(model.predict(df[FEATURES]), index=df.index).clip(0, 100)
+    demo_eva = pick_demo_eva(df, all_pred, test_ids)
+    payload = make_hud_json(df, all_pred, demo_eva)
+
+    DEMO_PATH.parent.mkdir(parents=True, exist_ok=True)
+    DEMO_PATH.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+    first, last = payload["timeline"][0], payload["timeline"][-1]
+    print(f"Saved HUD demo: {DEMO_PATH}")
+    print(f"Demo EVA: {demo_eva}  fault: {payload.get('fault')}")
+    print(
+        f"{first['t_min']} min  {first['predicted_pct']}%  {status_label(first['predicted_pct'])}"
+        f"  ->  "
+        f"{last['t_min']} min  {last['predicted_pct']}%  {status_label(last['predicted_pct'])}"
+    )
 
 
 if __name__ == "__main__":
