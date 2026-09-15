@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import pickle
 from pathlib import Path
 
@@ -19,7 +20,8 @@ from sim import (
     BREACH_WATER_RESERVE_H,
     ECLSS_LOAD_KW,
 )
-from train import (
+from train import CRITICAL_THRESHOLD, status_label
+from train_habitat import (
     CAUTION_BATTERY_FRAC,
     CAUTION_PPCO2,
     CAUTION_PPO2,
@@ -34,6 +36,8 @@ from train import (
 
 DATA_PATH = Path("data/episodes.parquet")
 MODEL_PATH = Path("models/ttb.pkl")
+EVA_DEMO_PATH = Path("predictions/eva_demo.json")
+BLEND_PATH = Path("Astronaut Health Simulation.blend")
 
 SCENARIO_LABELS = {
     "nominal": "Nominal",
@@ -404,6 +408,256 @@ def build_charts(
 
 
 # ---------------------------------------------------------------------------
+# EVA suit HUD (train.py + Blender scene)
+# ---------------------------------------------------------------------------
+
+
+@st.cache_data
+def load_eva_demo() -> dict:
+    if not EVA_DEMO_PATH.exists():
+        raise FileNotFoundError(
+            f"{EVA_DEMO_PATH} not found. Run `python train.py` to export the HUD timeline."
+        )
+    return json.loads(EVA_DEMO_PATH.read_text(encoding="utf-8"))
+
+
+def build_helmet_hud(frame: dict, meta: dict) -> str:
+    risk = frame["predicted_pct"]
+    critical = frame["is_critical"]
+    status = status_label(risk)
+    accent = "#ff3333" if critical else "#33ff99"
+    bar_w = min(100, max(0, risk))
+    return (
+        '<div style="font-family:monospace;background:#050810;border:2px solid '
+        f'{accent};border-radius:12px;padding:18px;color:#e8e8e8;max-width:640px;">'
+        '<div style="color:#888;font-size:11px;letter-spacing:2px;">AEGIS HELMET HUD</div>'
+        f'<div style="font-size:2rem;font-weight:bold;color:{accent};margin:8px 0;">{status}</div>'
+        f'<div style="font-size:2.8rem;font-weight:bold;">{risk:.1f}<span style="font-size:1rem;color:#888;"> % RISK</span></div>'
+        f'<div style="background:#222;border-radius:4px;height:10px;margin:12px 0;">'
+        f'<div style="background:{accent};width:{bar_w}%;height:10px;border-radius:4px;"></div></div>'
+        f'<div style="color:#666;font-size:11px;margin-bottom:10px;">threshold {meta["critical_threshold"]:.0f}%</div>'
+        '<div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;font-size:13px;">'
+        f'<div>HR <b>{frame["hr_bpm"]}</b> bpm</div>'
+        f'<div>RESP <b>{frame["resp_rpm"]}</b> rpm</div>'
+        f'<div>SpO₂ <b>{frame["spo2_pct"]}</b> %</div>'
+        f'<div>Core <b>{frame["core_temp_c"]:.1f}</b> °C</div>'
+        f'<div>CO₂ <b>{frame["helmet_co2_ppm"]}</b> ppm</div>'
+        f'<div>Press <b>{frame["suit_press_kpa"]:.1f}</b> kPa</div>'
+        f'<div>Ext <b>{frame["ext_temp_c"]:.1f}</b> °C</div>'
+        f'<div>t = <b>{frame["t_min"]}</b> min</div>'
+        "</div></div>"
+    )
+
+
+def build_eva_charts(timeline: list[dict], tick_idx: int) -> go.Figure:
+    df = pd.DataFrame(timeline)
+    current_t = df.iloc[tick_idx]["t_min"]
+    fig = make_subplots(
+        rows=2,
+        cols=2,
+        subplot_titles=("Health risk (%)", "Heart rate", "Helmet CO₂", "Suit pressure"),
+        vertical_spacing=0.14,
+        horizontal_spacing=0.08,
+    )
+    fig.add_trace(
+        go.Scatter(x=df["t_min"], y=df["predicted_pct"], line=dict(color="#ff6b6b", width=2)),
+        row=1,
+        col=1,
+    )
+    fig.add_hline(y=CRITICAL_THRESHOLD, row=1, col=1, line=dict(color="#888", dash="dash"))
+    fig.add_trace(
+        go.Scatter(x=df["t_min"], y=df["hr_bpm"], line=dict(color="#4cc9f0", width=2)),
+        row=1,
+        col=2,
+    )
+    fig.add_trace(
+        go.Scatter(x=df["t_min"], y=df["helmet_co2_ppm"], line=dict(color="#f4a261", width=2)),
+        row=2,
+        col=1,
+    )
+    fig.add_trace(
+        go.Scatter(x=df["t_min"], y=df["suit_press_kpa"], line=dict(color="#90be6d", width=2)),
+        row=2,
+        col=2,
+    )
+    for row in (1, 2):
+        for col in (1, 2):
+            fig.add_vline(x=current_t, row=row, col=col, line=dict(color="#fff", width=1, dash="dot"))
+    fig.update_layout(
+        template="plotly_dark",
+        paper_bgcolor="#0e1117",
+        plot_bgcolor="#1a1a2e",
+        height=480,
+        showlegend=False,
+        margin=dict(t=40, b=30),
+    )
+    fig.update_xaxes(title_text="minutes", gridcolor="#333")
+    fig.update_yaxes(gridcolor="#333")
+    return fig
+
+
+def render_eva_tab() -> None:
+    try:
+        demo = load_eva_demo()
+    except FileNotFoundError as exc:
+        st.error(str(exc))
+        return
+
+    timeline = demo["timeline"]
+    max_idx = len(timeline) - 1
+
+    if "eva_tick_idx" not in st.session_state:
+        st.session_state.eva_tick_idx = 0
+    if "eva_playing" not in st.session_state:
+        st.session_state.eva_playing = False
+
+    st.markdown(
+        f"**EVA {demo['eva_id']}** — fault: `{demo.get('fault', 'unknown')}`  "
+        f"· same timeline drives the Blender helmet HUD"
+    )
+
+    c1, c2, c3 = st.columns([1, 1, 2])
+    with c1:
+        if st.button("▶ Play EVA", use_container_width=True, key="eva_play"):
+            st.session_state.eva_playing = True
+    with c2:
+        if st.button("⏸ Pause EVA", use_container_width=True, key="eva_pause"):
+            st.session_state.eva_playing = False
+    with c3:
+        if BLEND_PATH.exists():
+            st.download_button(
+                "⬇ Download Blender scene (.blend)",
+                data=BLEND_PATH.read_bytes(),
+                file_name=BLEND_PATH.name,
+                mime="application/octet-stream",
+                use_container_width=True,
+            )
+        else:
+            st.caption("Blender scene not found in repo.")
+
+    st.session_state.eva_tick_idx = st.slider(
+        "EVA replay (index)",
+        0,
+        max_idx,
+        st.session_state.eva_tick_idx,
+        key="eva_slider",
+    )
+    frame = timeline[st.session_state.eva_tick_idx]
+
+    col_hud, col_info = st.columns([1, 1])
+    with col_hud:
+        components.html(build_helmet_hud(frame, demo), height=320, scrolling=False)
+    with col_info:
+        st.markdown(
+            """
+            **Blender integration**
+
+            1. Download `Astronaut Health Simulation.blend`
+            2. Open in Blender 3.x+
+            3. Point the HUD script at `predictions/eva_demo.json`
+               (exported by `python train.py`)
+
+            The web HUD above replays the same JSON timeline the helmet
+            display uses during the EVA walkthrough.
+            """
+        )
+
+    st.plotly_chart(build_eva_charts(timeline, st.session_state.eva_tick_idx), use_container_width=True)
+
+    if st.session_state.eva_playing and st.session_state.eva_tick_idx < max_idx:
+        st.session_state.eva_tick_idx += 1
+        st.rerun()
+
+
+def render_habitat_tab() -> None:
+    if not DATA_PATH.exists() or not MODEL_PATH.exists():
+        st.error("Run `python generate.py` and `python train_habitat.py` first.")
+        st.stop()
+
+    # --- sidebar content moved inline for tab context ---
+    scenario = st.selectbox(
+        "Fault scenario",
+        options=list(SCENARIO_LABELS.keys()),
+        format_func=lambda k: SCENARIO_LABELS[k],
+        key="habitat_scenario",
+    )
+    episode_id = DEMO_EPISODE_IDS[scenario]
+    st.caption(f"Replay episode #{episode_id}")
+
+    ep = prepare_episode(episode_id)
+    max_idx = len(ep) - 1
+
+    if "tick_idx" not in st.session_state:
+        st.session_state.tick_idx = 0
+    if st.session_state.get("last_scenario") != scenario:
+        st.session_state.tick_idx = 0
+        st.session_state.last_scenario = scenario
+        st.session_state.playing = False
+
+    col1, col2, col3 = st.columns([1, 1, 2])
+    with col1:
+        if st.button("▶ Play", use_container_width=True, key="hab_play"):
+            st.session_state.playing = True
+    with col2:
+        if st.button("⏸ Pause", use_container_width=True, key="hab_pause"):
+            st.session_state.playing = False
+    with col3:
+        st.session_state.tick_idx = st.slider(
+            "Replay time (index)",
+            0,
+            max_idx,
+            st.session_state.tick_idx,
+            key="hab_slider",
+        )
+
+    row = ep.iloc[st.session_state.tick_idx]
+    st.markdown(f"**t = {int(row['t_min'])} min** ({row['t_min'] / 60:.1f} h)")
+
+    pred_ttb = float(row["pred_ttb"])
+    pred_fault = str(row["pred_fault"])
+    pred_conf = float(row["pred_fault_conf"])
+    ml_active = ml_alarm_active(row)
+    fault_type = row["fault_type"]
+
+    feat_ep = ep.dropna(subset=["pred_ttb"])
+    ml_t = ml_alarm_time(feat_ep, feat_ep["pred_ttb"].values)
+    thr_t = threshold_alarm_time(ep)
+
+    status_label_hab, _ = overall_status(row, pred_ttb)
+    status_class = {
+        "GREEN": "status-green",
+        "WATCH": "status-watch",
+        "ALARM": "status-alarm",
+    }[status_label_hab]
+
+    st.markdown(
+        f"""
+        <div class="status-panel">
+          <div class="{status_class}">{status_label_hab}</div>
+          <div class="metric-mono">Predicted time to breach: <b>{pred_ttb:.0f} min</b></div>
+          <div class="metric-mono">Predicted fault: <b>{pred_fault}</b>
+            (confidence {pred_conf:.0%})</div>
+          <div class="metric-mono">Actual scenario: <b>{fault_type}</b></div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    svg = build_habitat_svg(row, fault_type, pred_fault, ml_active)
+    components.html(
+        f'<div style="background:#0e1117;padding:4px 0;">{svg}</div>',
+        height=400,
+        scrolling=False,
+    )
+
+    st.plotly_chart(build_charts(ep, st.session_state.tick_idx, ml_t, thr_t), use_container_width=True)
+
+    if st.session_state.get("playing") and st.session_state.tick_idx < max_idx:
+        st.session_state.tick_idx += 1
+        st.rerun()
+
+
+# ---------------------------------------------------------------------------
 # App
 # ---------------------------------------------------------------------------
 
@@ -433,103 +687,21 @@ def apply_dark_theme() -> None:
 
 
 def main() -> None:
-    st.set_page_config(page_title="AEGIS Habitat Monitor", layout="wide", initial_sidebar_state="expanded")
+    st.set_page_config(
+        page_title="AEGIS — Mars Life Support",
+        layout="wide",
+        initial_sidebar_state="collapsed",
+    )
     apply_dark_theme()
 
-    if not DATA_PATH.exists() or not MODEL_PATH.exists():
-        st.error("Run `python generate.py` and `python train.py` first.")
-        st.stop()
+    st.title("AEGIS — Mars Life Support & EVA Health")
 
-    st.title("AEGIS — Mars Habitat Life Support Monitor")
+    tab_habitat, tab_eva = st.tabs(["Habitat monitor", "EVA suit HUD"])
 
-    # --- sidebar ---
-    with st.sidebar:
-        st.header("Scenario")
-        scenario = st.selectbox(
-            "Fault scenario",
-            options=list(SCENARIO_LABELS.keys()),
-            format_func=lambda k: SCENARIO_LABELS[k],
-        )
-        episode_id = DEMO_EPISODE_IDS[scenario]
-        st.caption(f"Replay episode #{episode_id}")
-
-        ep = prepare_episode(episode_id)
-        max_idx = len(ep) - 1
-
-        if "tick_idx" not in st.session_state:
-            st.session_state.tick_idx = 0
-        if st.session_state.get("last_scenario") != scenario:
-            st.session_state.tick_idx = 0
-            st.session_state.last_scenario = scenario
-            st.session_state.playing = False
-
-        col1, col2 = st.columns(2)
-        with col1:
-            if st.button("▶ Play", use_container_width=True):
-                st.session_state.playing = True
-        with col2:
-            if st.button("⏸ Pause", use_container_width=True):
-                st.session_state.playing = False
-
-        st.session_state.tick_idx = st.slider(
-            "Replay time (index)",
-            0,
-            max_idx,
-            st.session_state.tick_idx,
-        )
-
-        row = ep.iloc[st.session_state.tick_idx]
-        st.markdown(f"**t = {int(row['t_min'])} min** ({row['t_min'] / 60:.1f} h)")
-
-    # --- predictions & alarms ---
-    row = ep.iloc[st.session_state.tick_idx]
-    fault_type = row["fault_type"]
-    pred_ttb = float(row["pred_ttb"])
-    pred_fault = str(row["pred_fault"])
-    pred_conf = float(row["pred_fault_conf"])
-    ml_active = ml_alarm_active(row)
-
-    feat_ep = ep.dropna(subset=["pred_ttb"])
-    pred_ttb_arr = feat_ep["pred_ttb"].values
-    ml_t = ml_alarm_time(feat_ep, pred_ttb_arr)
-    thr_t = threshold_alarm_time(ep)
-
-    status_label, status_color = overall_status(row, pred_ttb)
-    status_class = {
-        "GREEN": "status-green",
-        "WATCH": "status-watch",
-        "ALARM": "status-alarm",
-    }[status_label]
-
-    # --- status panel ---
-    st.markdown(
-        f"""
-        <div class="status-panel">
-          <div class="{status_class}">{status_label}</div>
-          <div class="metric-mono">Predicted time to breach: <b>{pred_ttb:.0f} min</b></div>
-          <div class="metric-mono">Predicted fault: <b>{pred_fault}</b>
-            (confidence {pred_conf:.0%})</div>
-          <div class="metric-mono">Actual scenario: <b>{fault_type}</b></div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    # --- habitat schematic (iframe avoids markdown code-block escaping of SVG) ---
-    svg = build_habitat_svg(row, fault_type, pred_fault, ml_active)
-    components.html(
-        f'<div style="background:#0e1117;padding:4px 0;">{svg}</div>',
-        height=400,
-        scrolling=False,
-    )
-
-    # --- charts ---
-    fig = build_charts(ep, st.session_state.tick_idx, ml_t, thr_t)
-    st.plotly_chart(fig, use_container_width=True)
-
-    if st.session_state.get("playing") and st.session_state.tick_idx < max_idx:
-        st.session_state.tick_idx += 1
-        st.rerun()
+    with tab_habitat:
+        render_habitat_tab()
+    with tab_eva:
+        render_eva_tab()
 
 
 if __name__ == "__main__":
