@@ -4,7 +4,10 @@
 from __future__ import annotations
 
 import json
+import os
 import pickle
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 import pandas as pd
@@ -38,6 +41,10 @@ DATA_PATH = Path("data/episodes.parquet")
 MODEL_PATH = Path("models/ttb.pkl")
 EVA_DEMO_PATH = Path("predictions/eva_demo.json")
 BLEND_PATH = Path("Astronaut Health Simulation.blend")
+
+# ElevenLabs Conversational AI — agent ID is public; API key stays in secrets.
+ELEVENLABS_AGENT_ID = "agent_5701m2k902y3fybs2ttq3mejjhdj"
+ELEVENLABS_WIDGET_SCRIPT = "https://unpkg.com/@elevenlabs/convai-widget-embed"
 
 SCENARIO_LABELS = {
     "nominal": "Nominal",
@@ -658,6 +665,93 @@ def render_habitat_tab() -> None:
 
 
 # ---------------------------------------------------------------------------
+# ElevenLabs voice assistant
+# ---------------------------------------------------------------------------
+
+
+def get_elevenlabs_config() -> tuple[str, str | None]:
+    """
+    Returns (agent_id, api_key_or_none).
+
+    API key is read from Streamlit secrets or ELEVENLABS_API_KEY env var.
+    Never hard-code the real key in this file.
+    """
+    agent_id = ELEVENLABS_AGENT_ID
+    api_key: str | None = None
+
+    try:
+        if "elevenlabs" in st.secrets:
+            agent_id = st.secrets.elevenlabs.get("agent_id", agent_id)
+            api_key = st.secrets.elevenlabs.get("api_key")
+    except Exception:
+        pass
+
+    if not api_key:
+        api_key = os.environ.get("ELEVENLABS_API_KEY")
+
+    return agent_id, api_key
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_elevenlabs_signed_url(api_key: str, agent_id: str) -> str | None:
+    """For agents with auth enabled — signed URL is generated server-side."""
+    url = (
+        "https://api.elevenlabs.io/v1/convai/conversation/get-signed-url"
+        f"?agent_id={agent_id}"
+    )
+    req = urllib.request.Request(url, headers={"xi-api-key": api_key})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            payload = json.loads(resp.read().decode())
+            return payload.get("signed_url")
+    except (urllib.error.URLError, urllib.error.HTTPError, KeyError, json.JSONDecodeError):
+        return None
+
+
+def build_elevenlabs_widget_html(agent_id: str, signed_url: str | None) -> str:
+    if signed_url:
+        auth_attr = f'signed-url="{signed_url}"'
+    else:
+        auth_attr = f'agent-id="{agent_id}"'
+    return (
+        f'<div style="min-height:520px;background:#0e1117;padding:12px;">'
+        f'<elevenlabs-convai {auth_attr} dismissible="true" variant="expanded"></elevenlabs-convai>'
+        f'<script src="{ELEVENLABS_WIDGET_SCRIPT}" async type="text/javascript"></script>'
+        "</div>"
+    )
+
+
+def render_voice_assistant_tab() -> None:
+    agent_id, api_key = get_elevenlabs_config()
+    signed_url = fetch_elevenlabs_signed_url(api_key, agent_id) if api_key else None
+
+    st.markdown(
+        "Talk to the **AEGIS mission assistant** about habitat status, EVA health, and alarms."
+    )
+
+    if api_key:
+        if signed_url:
+            st.caption("Authenticated agent session (signed URL from your API key).")
+        else:
+            st.warning(
+                "API key is set but signed URL fetch failed. "
+                "Falling back to public agent-id embed — disable auth on the agent, or check the key."
+            )
+    else:
+        st.info(
+            "No API key configured — using public widget embed. "
+            "Ensure **authentication is disabled** on this agent in the ElevenLabs dashboard, "
+            "or add your key to Streamlit secrets (see README)."
+        )
+
+    components.html(
+        build_elevenlabs_widget_html(agent_id, signed_url),
+        height=560,
+        scrolling=True,
+    )
+
+
+# ---------------------------------------------------------------------------
 # App
 # ---------------------------------------------------------------------------
 
@@ -696,12 +790,16 @@ def main() -> None:
 
     st.title("AEGIS — Mars Life Support & EVA Health")
 
-    tab_habitat, tab_eva = st.tabs(["Habitat monitor", "EVA suit HUD"])
+    tab_habitat, tab_eva, tab_voice = st.tabs(
+        ["Habitat monitor", "EVA suit HUD", "Voice assistant"]
+    )
 
     with tab_habitat:
         render_habitat_tab()
     with tab_eva:
         render_eva_tab()
+    with tab_voice:
+        render_voice_assistant_tab()
 
 
 if __name__ == "__main__":

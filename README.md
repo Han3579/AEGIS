@@ -91,6 +91,33 @@ Hosted at **[aegismarshack.streamlit.app](https://aegismarshack.streamlit.app/)*
 - Helmet-style HUD with live vitals and risk %
 - Download **Astronaut Health Simulation.blend** for the 3D Blender scene
 
+### Voice assistant (ElevenLabs)
+
+- **Voice assistant** tab embeds ElevenLabs Conversational AI
+- Agent ID: `agent_5701m2k902y3fybs2ttq3mejjhdj`
+
+#### Where to put your ElevenLabs API key
+
+**Do not commit the real key.** Use one of:
+
+| Environment | Location |
+|-------------|----------|
+| **Streamlit Cloud** (production) | [share.streamlit.io](https://share.streamlit.io) → your app → **Settings → Secrets** |
+| **Local dev** | Copy `.streamlit/secrets.toml.example` → `.streamlit/secrets.toml` |
+
+```toml
+[elevenlabs]
+api_key = "sk_your_elevenlabs_api_key_here"
+agent_id = "agent_5701m2k902y3fybs2ttq3mejjhdj"
+```
+
+Alternative for local dev only: export `ELEVENLABS_API_KEY=sk_...` in your shell.
+
+**When is the API key needed?**
+
+- **Public agent** (auth disabled in ElevenLabs dashboard): widget works with agent ID only — no key required.
+- **Private / authenticated agent**: the app uses your API key server-side to fetch a **signed URL** (never exposed in the browser).
+
 ---
 
 ## Repository layout
