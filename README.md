@@ -96,18 +96,18 @@ Hosted at **[aegismarshack.streamlit.app](https://aegismarshack.streamlit.app/)*
 ## Repository layout
 
 ```
-sim.py              Headless habitat physics
-smoke_sim.py        One-line sim sanity check
-generate.py         Episode dataset builder
-train_habitat.py    Habitat TTB + fault models → models/ttb.pkl
-train.py            EVA suit health model → models/health_regressor.joblib
-                    + predictions/eva_demo.json (Blender HUD feed)
-app.py              Streamlit dashboard
-data/               Generated episodes (parquet)
-models/             Trained model artifacts
-predictions/        EVA demo timeline for Blender
-suit_telemetry.csv  EVA training data
-Astronaut Health Simulation.blend   Blender helmet HUD scene
+sim.py                               Headless habitat physics
+smoke_sim.py                         One-line sim sanity check
+generate.py                          Episode dataset builder
+train_habitat.py                     Habitat TTB + fault models → models/ttb.pkl
+machine_learning_model.py            EVA suit health model → models/health_regressor.joblib
+                                     + predictions/eva_demo.json (Blender HUD feed)
+app.py                               Streamlit dashboard
+data/                                Generated episodes (parquet)
+models/                              Trained model artifacts
+predictions/                         EVA demo timeline for Blender
+suit_telemetry.csv                   EVA training data
+Astronaut Health Simulation.blend    Blender helmet HUD scene
 ```
 
 ---
