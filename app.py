@@ -804,32 +804,42 @@ def render_habitat_tab() -> None:
 # ---------------------------------------------------------------------------
 
 
-def get_elevenlabs_config() -> tuple[str, str | None]:
+def get_elevenlabs_config() -> tuple[str, str | None, str]:
     """
-    Returns (agent_id, api_key_or_none).
+    Returns (agent_id, api_key_or_none, source).
 
     API key is read from Streamlit secrets or ELEVENLABS_API_KEY env var.
     Never hard-code the real key in this file.
     """
     agent_id = ELEVENLABS_AGENT_ID
     api_key: str | None = None
+    source = "none"
 
     try:
         if "elevenlabs" in st.secrets:
             agent_id = st.secrets.elevenlabs.get("agent_id", agent_id)
             api_key = st.secrets.elevenlabs.get("api_key")
+            if api_key:
+                source = "secrets"
     except Exception:
         pass
 
     if not api_key:
         api_key = os.environ.get("ELEVENLABS_API_KEY")
+        if api_key:
+            source = "environment"
 
-    return agent_id, api_key
+    return agent_id, api_key, source
 
 
-@st.cache_data(ttl=300, show_spinner=False)
-def fetch_elevenlabs_signed_url(api_key: str, agent_id: str) -> str | None:
-    """For agents with auth enabled — signed URL is generated server-side."""
+def mask_api_key(api_key: str) -> str:
+    if len(api_key) <= 8:
+        return "••••••••"
+    return f"{api_key[:3]}…{api_key[-4:]}"
+
+
+def fetch_elevenlabs_signed_url(api_key: str, agent_id: str) -> tuple[str | None, str | None]:
+    """Request a signed URL for authenticated agents. Returns (url, error_message)."""
     url = (
         "https://api.elevenlabs.io/v1/convai/conversation/get-signed-url"
         f"?agent_id={agent_id}"
@@ -838,9 +848,23 @@ def fetch_elevenlabs_signed_url(api_key: str, agent_id: str) -> str | None:
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
             payload = json.loads(resp.read().decode())
-            return payload.get("signed_url")
-    except (urllib.error.URLError, urllib.error.HTTPError, KeyError, json.JSONDecodeError):
-        return None
+            signed = payload.get("signed_url")
+            if signed:
+                return signed, None
+            return None, "API response did not include a signed_url."
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode(errors="replace").strip()[:240]
+        detail = body or exc.reason
+        return None, f"HTTP {exc.code}: {detail}"
+    except urllib.error.URLError as exc:
+        return None, f"Network error: {exc.reason}"
+    except (KeyError, json.JSONDecodeError) as exc:
+        return None, f"Invalid API response: {exc}"
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def cached_elevenlabs_signed_url(api_key: str, agent_id: str) -> tuple[str | None, str | None]:
+    return fetch_elevenlabs_signed_url(api_key, agent_id)
 
 
 def build_elevenlabs_widget_html(agent_id: str, signed_url: str | None) -> str:
@@ -856,29 +880,90 @@ def build_elevenlabs_widget_html(agent_id: str, signed_url: str | None) -> str:
     )
 
 
+def render_elevenlabs_connection_panel(
+    agent_id: str,
+    api_key: str | None,
+    source: str,
+) -> str | None:
+    """Show config + test controls; return signed URL to use for the widget."""
+    with st.container(border=True):
+        st.markdown("**Connection status**")
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            st.markdown("**Agent ID**")
+            st.code(agent_id, language=None)
+        with c2:
+            st.markdown("**API key**")
+            if api_key:
+                st.success(f"Loaded from {source} · `{mask_api_key(api_key)}`")
+            else:
+                st.warning("Not configured")
+        with c3:
+            st.markdown("**Auth mode**")
+            st.caption("Signed URL" if api_key else "Public agent-id embed")
+
+        signed_url: str | None = None
+
+        if api_key:
+            if api_key.strip().endswith("_here"):
+                st.warning("API key still looks like the placeholder from secrets.toml.example.")
+
+            if st.button("Test connection", type="primary", use_container_width=True, key="elevenlabs_test_btn"):
+                cached_elevenlabs_signed_url.clear()
+                signed_url, signed_error = fetch_elevenlabs_signed_url(api_key, agent_id)
+                st.session_state.elevenlabs_test = {
+                    "ok": signed_url is not None,
+                    "error": signed_error,
+                    "signed_url": signed_url,
+                }
+            elif "elevenlabs_test" in st.session_state:
+                signed_url = st.session_state.elevenlabs_test.get("signed_url")
+            else:
+                signed_url, signed_error = cached_elevenlabs_signed_url(api_key, agent_id)
+                if signed_url:
+                    st.session_state.elevenlabs_test = {
+                        "ok": True,
+                        "error": None,
+                        "signed_url": signed_url,
+                    }
+                else:
+                    st.session_state.elevenlabs_test = {
+                        "ok": False,
+                        "error": signed_error,
+                        "signed_url": None,
+                    }
+
+            test = st.session_state.get("elevenlabs_test")
+            if test:
+                if test["ok"]:
+                    st.success("Connection OK — signed URL retrieved. Use the widget below to talk to the agent.")
+                    signed_url = test.get("signed_url")
+                else:
+                    st.error(f"Connection failed: {test.get('error') or 'Unknown error'}")
+                    st.caption(
+                        "Check that the API key is valid, the agent ID matches your ElevenLabs agent, "
+                        "and the agent has authentication enabled. Or disable auth on the agent to use the public embed."
+                    )
+        else:
+            st.info(
+                "Add `[elevenlabs] api_key` to Streamlit secrets (see `.streamlit/secrets.toml.example`), "
+                "then click **Test connection**. Without a key, the public agent-id embed is used."
+            )
+
+    return signed_url
+
+
 def render_voice_assistant_tab() -> None:
-    agent_id, api_key = get_elevenlabs_config()
-    signed_url = fetch_elevenlabs_signed_url(api_key, agent_id) if api_key else None
+    agent_id, api_key, source = get_elevenlabs_config()
 
     render_section(
         "Voice Assistant",
         "Ask about habitat status, EVA health, and alarm timelines",
     )
 
-    if api_key:
-        if signed_url:
-            st.caption("Authenticated session via signed URL.")
-        else:
-            st.warning(
-                "API key is set but signed URL fetch failed. "
-                "Falling back to public embed — disable auth on the agent, or check the key."
-            )
-    else:
-        st.info(
-            "No API key configured — using public widget. "
-            "Disable authentication on the agent in ElevenLabs, or add your key to Streamlit secrets."
-        )
+    signed_url = render_elevenlabs_connection_panel(agent_id, api_key, source)
 
+    st.markdown("**Live widget** — click the microphone to start a conversation.")
     with st.container(border=True):
         components.html(
             build_elevenlabs_widget_html(agent_id, signed_url),
