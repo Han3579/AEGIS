@@ -10,6 +10,7 @@ import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import streamlit as st
+import streamlit.components.v1 as components
 
 from sim import (
     BATTERY_CAPACITY_KWH,
@@ -259,14 +260,15 @@ def _module_svg(
             f'<rect class="pulse-outline" x="{x - 3}" y="{y - 3}" '
             f'width="{w + 6}" height="{h + 6}" rx="{rx + 2}"/>'
         )
-    return f"""
-    <g id="mod-{key}">
-      <rect x="{x}" y="{y}" width="{w}" height="{h}" rx="{rx}"
-            fill="{fill}" stroke="#555" stroke-width="1.5"/>
-      {pulse_rect}
-      <text x="{x + w / 2}" y="{y + 22}" class="mod-label">{title}</text>
-      <text x="{x + w / 2}" y="{y + 48}" class="mod-value">{value}</text>
-    </g>"""
+    return (
+        f'<g id="mod-{key}">'
+        f'<rect x="{x}" y="{y}" width="{w}" height="{h}" rx="{rx}" '
+        f'fill="{fill}" stroke="#555" stroke-width="1.5"/>'
+        f"{pulse_rect}"
+        f'<text x="{x + w / 2}" y="{y + 22}" class="mod-label">{title}</text>'
+        f'<text x="{x + w / 2}" y="{y + 48}" class="mod-value">{value}</text>'
+        f"</g>"
+    )
 
 
 def build_habitat_svg(
@@ -299,44 +301,21 @@ def build_habitat_svg(
         pulse = ml_active and pulse_module == key
         modules += _module_svg(key, title, fill, values[key], pulse)
 
-    return f"""
-<style>
-  @keyframes habitat-pulse {{
-    0%, 100% {{ stroke-opacity: 1; }}
-    50% {{ stroke-opacity: 0.25; }}
-  }}
-  .habitat-svg .mod-label {{
-    fill: #e0e0e0;
-    font-family: monospace;
-    font-size: 11px;
-    text-anchor: middle;
-  }}
-  .habitat-svg .mod-value {{
-    fill: #ffffff;
-    font-family: monospace;
-    font-size: 12px;
-    font-weight: bold;
-    text-anchor: middle;
-  }}
-  .habitat-svg .pulse-outline {{
-    animation: habitat-pulse 1.4s ease-in-out infinite;
-    stroke: #00d4ff;
-    stroke-width: 3;
-    fill: none;
-  }}
-  .habitat-svg .plan-title {{
-    fill: #888;
-    font-family: monospace;
-    font-size: 13px;
-  }}
-</style>
-<svg class="habitat-svg" viewBox="0 0 340 370" xmlns="http://www.w3.org/2000/svg"
-     style="width:100%;max-width:520px;background:#1a1a2e;border-radius:8px;">
-  <text x="170" y="24" class="plan-title" text-anchor="middle">HABITAT PLAN (TOP-DOWN)</text>
-  {corridors}
-  {modules}
-</svg>
-"""
+    return (
+        '<svg class="habitat-svg" viewBox="0 0 340 370" '
+        'xmlns="http://www.w3.org/2000/svg" '
+        'style="width:100%;max-width:520px;background:#1a1a2e;border-radius:8px;">'
+        "<defs><style>"
+        "@keyframes habitat-pulse{0%,100%{stroke-opacity:1}50%{stroke-opacity:.25}}"
+        ".mod-label{fill:#e0e0e0;font-family:monospace;font-size:11px;text-anchor:middle}"
+        ".mod-value{fill:#fff;font-family:monospace;font-size:12px;font-weight:bold;text-anchor:middle}"
+        ".pulse-outline{animation:habitat-pulse 1.4s ease-in-out infinite;stroke:#00d4ff;stroke-width:3;fill:none}"
+        ".plan-title{fill:#888;font-family:monospace;font-size:13px}"
+        "</style></defs>"
+        '<text x="170" y="24" class="plan-title" text-anchor="middle">HABITAT PLAN (TOP-DOWN)</text>'
+        f"{corridors}{modules}"
+        "</svg>"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -536,9 +515,13 @@ def main() -> None:
         unsafe_allow_html=True,
     )
 
-    # --- habitat schematic ---
+    # --- habitat schematic (iframe avoids markdown code-block escaping of SVG) ---
     svg = build_habitat_svg(row, fault_type, pred_fault, ml_active)
-    st.markdown(svg, unsafe_allow_html=True)
+    components.html(
+        f'<div style="background:#0e1117;padding:4px 0;">{svg}</div>',
+        height=400,
+        scrolling=False,
+    )
 
     # --- charts ---
     fig = build_charts(ep, st.session_state.tick_idx, ml_t, thr_t)
